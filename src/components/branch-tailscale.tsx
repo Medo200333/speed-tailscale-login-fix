@@ -1,89 +1,72 @@
 import { useEffect, useState } from "react";
 import { useServerFn } from "@tanstack/react-start";
-import { tsOpenSiteFn, reachDeviceFn } from "@/lib/tailscale.functions";
-import { TAILSCALE_PAGES, parseBranchTarget } from "@/lib/access/tailscale-core";
+import { tsDevicesFn, tsSwitchFn, reachDeviceFn } from "@/lib/tailscale.functions";
 import { Button } from "./access-ui";
 
 type Found = { ip: string; httpPort: number; model: string; peer: string };
-type Row = { name: string; host: string; port: number; result?: string; model?: string; ok?: boolean };
-const KEY = "speed-branch-targets";
-const load = (): Row[] => { try { const v = JSON.parse(localStorage.getItem(KEY) || "[]"); return Array.isArray(v) ? v.filter((r) => r && parseBranchTarget(`${r.host}:${r.port}`)).map((r) => ({ name: String(r.name || "").slice(0, 60), host: r.host, port: r.port })) : []; } catch { return []; } };
+type Device = { name: string; dns: string; ip: string; os: string; online: boolean };
+type Snapshot = { state: string; account: string; displayName: string; selfName: string; selfIp: string; authUrl: string; devices: Device[] };
 
-/**
- * "ربط Tailscale": opens the public Tailscale website (no email, no saved account) in a private
- * window with a fresh empty profile. The client signs in with THEIR OWN account there, approves
- * the branch subnet routes, then types each branch device IP here and tests it.
- */
+/** Reads devices from the Tailscale client installed on this PC. The website alone is not a connection. */
 export function TailscaleLink({ onPick }: { onPick: (row: Found) => void }) {
-  const openSite = useServerFn(tsOpenSiteFn), reach = useServerFn(reachDeviceFn);
-  const [open, setOpen] = useState(false), [note, setNote] = useState(""), [warn, setWarn] = useState("");
-  const [rows, setRows] = useState<Row[]>([]), [ip, setIp] = useState(""), [label, setLabel] = useState(""), [busy, setBusy] = useState(false);
-  useEffect(() => { setRows(load()); }, []);
-  const save = (next: Row[]) => { setRows(next); try { localStorage.setItem(KEY, JSON.stringify(next.map(({ name, host, port }) => ({ name, host, port })))); } catch { /* private mode */ } };
-  const go = async (page: "login" | "machines") => {
-    setOpen(true); setWarn(""); setNote("جارٍ فتح موقع Tailscale في نافذة خاصة…");
+  const load = useServerFn(tsDevicesFn), switchAccount = useServerFn(tsSwitchFn), reach = useServerFn(reachDeviceFn);
+  const [snap, setSnap] = useState<Snapshot | null>(null);
+  const [note, setNote] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [testing, setTesting] = useState("");
+
+  const refresh = async () => {
+    setBusy(true); setNote("");
     try {
-      const r = await openSite({ data: { page } });
-      if (!r.ok) return setNote(r.error);
-      setNote(r.data.dryRun ? "وضع تجريبي: لم يُفتح متصفح." : "اتفتح موقع Tailscale في نافذة خاصة جديدة بدون أي حساب محفوظ. سجّل الدخول بحساب Tailscale بتاعك (اللي عليه كمبيوترات الفروع).");
-      if (!r.data.private && !r.data.dryRun) setWarn("لم يُعثر على Edge أو Chrome أو Firefox. اضغط «نسخ الرابط» وافتحه في نافذة خاصة (Ctrl+Shift+N).");
-    } catch { setNote("انقطع الاتصال بالبرنامج. أعد المحاولة."); }
+      const r = await load({});
+      if (!r.ok) { setNote(r.error); return; }
+      setSnap(r.data);
+      if (r.data.state && r.data.state !== "Running") setNote(r.data.state === "NeedsLogin" ? "Tailscale على الويندوز مش داخل على حساب. اضغط «تغيير الحساب» وسجّل بجيميل الشبكة." : `حالة Tailscale: ${r.data.state}`);
+      else if (!r.data.devices.length) setNote("متصل، لكن مفيش أجهزة تانية ظاهرة على الحساب ده.");
+    } catch { setNote("تعذر قراءة Tailscale."); }
+    finally { setBusy(false); }
   };
-  const copy = (url: string) => void navigator.clipboard?.writeText(url).then(() => setNote("تم نسخ الرابط."), () => setNote("انسخ الرابط يدوياً: " + url));
-  const add = () => {
-    const t = parseBranchTarget(ip);
-    if (!t) return setWarn("اكتب عنوان IP خاص للبصمة، مثل 192.168.1.2 أو 100.64.0.2:8000. عنوان الإنترنت العام مرفوض.");
-    setWarn(""); if (!rows.some((r) => r.host === t.host && r.port === t.port)) save([...rows, { name: label.trim().slice(0, 60), ...t }]);
-    setIp(""); setLabel("");
+  useEffect(() => { void refresh(); }, []);
+
+  const relog = async () => {
+    setBusy(true); setNote("هيخرج الحساب الحالي من Tailscale على الويندوز ويفتح صفحة دخول جديدة…");
+    try {
+      const r = await switchAccount({});
+      if (!r.ok) { setNote(r.error); return; }
+      setNote(r.data.opened ? "اتفتحت صفحة الدخول في نافذة خاصة. سجّل بالجيميل المطلوب، وبعدين اضغط «تحديث الأجهزة»." : r.data.url ? `افتح الرابط في نافذة خاصة ثم حدّث: ${r.data.url}` : "اتعمل خروج. افتح برنامج Tailscale وسجّل الدخول، ثم اضغط تحديث.");
+    } catch { setNote("تعذر تغيير الحساب."); }
+    finally { setBusy(false); }
   };
-  const testAll = async () => {
-    setBusy(true);
-    const next: Row[] = [];
-    for (const r of rows) {
-      try { const x = await reach({ data: { host: r.host, port: r.port } }); next.push({ ...r, ok: x.ok && x.data.reachable, model: x.ok ? x.data.model : "", result: x.ok ? (x.data.reachable ? `يصل (${x.data.ms} ms)${x.data.hikvision ? " · Hikvision" : ""}` : "لا يصل") : x.error }); }
-      catch { next.push({ ...r, ok: false, result: "تعذر الاختبار" }); }
-    }
-    setRows(next); setBusy(false);
-  };
+
   return (
     <div className="ac-stack">
-      <Button onClick={() => void go("login")}>ربط Tailscale (أجهزة الفروع)</Button>
-      {open ? (
-        <div className="ac-card ac-stack">
-          {note ? <p className="ac-message">{note}</p> : null}
-          {warn ? <p className="ac-error">{warn}</p> : null}
-          <p>رابط الموقع: <bdi dir="ltr">{TAILSCALE_PAGES.login}</bdi></p>
-          <div className="ac-toolbar">
-            <Button onClick={() => copy(TAILSCALE_PAGES.login)}>نسخ الرابط</Button>
-            <Button onClick={() => void go("login")}>فتح في نافذة خاصة</Button>
-            <Button onClick={() => void go("machines")}>صفحة الأجهزة (Machines)</Button>
-          </div>
-          <ol className="ac-muted">
-            <li>سجّل الدخول في موقع Tailscale بحسابك.</li>
-            <li>من Machines افتح كل كمبيوتر فرع ← Edit route settings ← فعّل مسار البصمة (مثال 192.168.1.2/32) ← Save.</li>
-            <li>اكتب عنوان كل بصمة هنا تحت واضغط «اختبار الكل».</li>
-          </ol>
-          <div className="ac-toolbar">
-            <input dir="ltr" placeholder="192.168.1.2" value={ip} onChange={(e) => setIp(e.target.value)} />
-            <input placeholder="اسم الفرع (اختياري)" value={label} onChange={(e) => setLabel(e.target.value)} />
-            <Button onClick={add}>إضافة عنوان</Button>
-            <Button primary disabled={busy || !rows.length} onClick={() => void testAll()}>{busy ? "جارٍ الاختبار…" : "اختبار الكل"}</Button>
-          </div>
-          {rows.map((r) => (
-            <p key={r.host + r.port}>
-              <bdi dir="ltr">{r.host}:{r.port}</bdi>{r.name ? <> · {r.name}</> : null}{r.result ? <> · {r.result}</> : null}{" "}
-              <Button onClick={() => onPick({ ip: r.host, httpPort: r.port, model: r.model || "", peer: r.name })}>إضافة الجهاز</Button>{" "}
-              <Button onClick={() => save(rows.filter((x) => x !== r))}>حذف</Button>
-            </p>
-          ))}
-          <p className="ac-muted">البرنامج لا يحفظ أي إيميل أو حساب Tailscale، ولا يشغّل Tailscale على هذا الكمبيوتر. لازم الكمبيوتر اللي عليه البرنامج يكون متصل بنفس حساب Tailscale وقابل لشبكات الفروع. الاختبار قراءة فقط ولا يرسل كلمات مرور.</p>
-        </div>
+      <div className="ac-toolbar">
+        <Button primary disabled={busy} onClick={() => void refresh()}>{busy ? "جارٍ القراءة…" : "تحديث الأجهزة"}</Button>
+        <Button disabled={busy} onClick={() => void relog()}>تغيير الحساب</Button>
+      </div>
+      {note ? <p className="ac-message">{note}</p> : null}
+      {snap ? (
+        <p>الحالة: {snap.state === "Running" ? "متصل" : snap.state || "غير معروف"}{snap.account ? <> · الحساب: <bdi dir="ltr">{snap.account}</bdi></> : null}{snap.displayName ? <> · {snap.displayName}</> : null} · هذا الجهاز: <bdi dir="ltr">{snap.selfName} {snap.selfIp}</bdi> · الأجهزة: {snap.devices.length}</p>
       ) : null}
+      {snap?.devices.map((d) => (
+        <p key={d.ip}>
+          {d.online ? "متصل" : "غير متصل"} · {d.name}{d.os ? ` · ${d.os}` : ""} · <bdi dir="ltr">{d.ip}</bdi>{" "}
+          <Button onClick={() => onPick({ ip: d.ip, httpPort: 80, model: "", peer: d.name })}>إضافة الجهاز</Button>{" "}
+          <Button disabled={testing === d.ip} onClick={async () => {
+            setTesting(d.ip);
+            try {
+              const r = await reach({ data: { host: d.ip, port: 80 } });
+              setNote(r.ok ? (r.data.reachable ? `${d.name} يصل (${r.data.ms} ms)${r.data.hikvision ? " · Hikvision" : ""}` : `${d.name} لا يصل على منفذ 80`) : r.error);
+            } catch { setNote("تعذر الاختبار."); }
+            finally { setTesting(""); }
+          }}>{testing === d.ip ? "جارٍ الاختبار…" : "اختبار الوصول"}</Button>
+        </p>
+      ))}
+      <p className="ac-muted">القائمة دي من برنامج Tailscale على الويندوز، مش من صفحة الموقع. قفل صفحة الموقع لا يغيّر شيئاً. «تغيير الحساب» يخرج الحساب الحالي من كمبيوتر الويندوز حتى تسجّل بالحساب المطلوب.</p>
     </div>
   );
 }
 
-/** Read-only "اختبار الوصول" for a device address. */
 export function ReachButton({ host, port }: { host: string; port: number }) {
   const reach = useServerFn(reachDeviceFn);
   const [msg, setMsg] = useState(""), [busy, setBusy] = useState(false);
@@ -91,7 +74,7 @@ export function ReachButton({ host, port }: { host: string; port: number }) {
     <span>
       <Button disabled={busy || !host.trim()} onClick={async () => {
         setBusy(true); setMsg("");
-        try { const r = await reach({ data: { host, port } }); setMsg(r.ok ? (r.data.reachable ? `يصل (${r.data.ms} ms)${r.data.hikvision ? " · جهاز Hikvision" : ""}` : "لا يصل. تأكد من ربط Tailscale وقبول شبكة الفرع.") : r.error); }
+        try { const r = await reach({ data: { host, port } }); setMsg(r.ok ? (r.data.reachable ? `يصل (${r.data.ms} ms)${r.data.hikvision ? " · جهاز Hikvision" : ""}` : "لا يصل.") : r.error); }
         catch { setMsg("تعذر الاختبار."); } finally { setBusy(false); }
       }}>{busy ? "جارٍ الاختبار…" : "اختبار الوصول"}</Button>
       {msg ? <span className="ac-muted"> {msg}</span> : null}
