@@ -1,52 +1,124 @@
 /**
- * "ربط Tailscale": opens the PUBLIC Tailscale website in a private browser window with a fresh,
- * empty temporary profile. The app never runs tailscale.exe, never reads this PC's Tailscale
- * account, and stores no Tailscale email/account/tailnet. SPEED_TAILSCALE_DRYRUN=1 launches nothing.
+ * Reads the Tailscale client already installed on this Windows PC (`tailscale status --json`)
+ * and returns its devices. The admin website is not a data source: closing it changes nothing.
+ * A login, when needed, uses the auth URL from the local client so THIS machine joins the tailnet.
  */
 import { AccessError } from "./store.server";
-import { TAILSCALE_PAGES, isDeviceAddress, isPublicTailscaleUrl, pickPrivateBrowser, type TailscalePage } from "./tailscale-core";
+import { AUTH_URL, isDeviceAddress, isTailscaleAuthUrl, pickPrivateBrowser } from "./tailscale-core";
 import { isapiFingerprint } from "./sadp.server";
 
-const dry = () => process.env.SPEED_TAILSCALE_DRYRUN === "1";
+type RawPeer = { HostName?: string; DNSName?: string; TailscaleIPs?: string[]; Online?: boolean; OS?: string; UserID?: number };
+type Status = {
+  BackendState?: string;
+  AuthURL?: string;
+  Self?: RawPeer;
+  User?: Record<string, { LoginName?: string; DisplayName?: string }>;
+  Peer?: Record<string, RawPeer>;
+};
+export type DeviceRow = { name: string; dns: string; ip: string; os: string; online: boolean };
 
-/** Drop private-browser profiles left behind by earlier clicks. A dir still open by the browser is skipped. */
-async function sweepOldProfiles(current: string) {
-  const { readdirSync, rmSync, statSync } = await import("node:fs");
-  const { tmpdir } = await import("node:os");
-  const { join } = await import("node:path");
-  const root = tmpdir();
-  let names: string[] = [];
-  try { names = readdirSync(root); } catch { return; }
-  const cutoff = Date.now() - 2 * 60 * 1000;
-  for (const name of names) {
-    if (!name.startsWith("speed-tailscale-")) continue;
-    const dir = join(root, name);
-    if (dir === current) continue;
-    try {
-      if (statSync(dir).mtimeMs > cutoff) continue;
-      rmSync(dir, { recursive: true, force: true });
-    } catch { /* still in use */ }
-  }
+function exeCandidates() {
+  return [process.env.TAILSCALE_EXE || "", "C:\\Program Files\\Tailscale\\tailscale.exe", "C:\\Program Files (x86)\\Tailscale\\tailscale.exe"].filter(Boolean);
 }
 
-export async function openTailscaleSite(page: TailscalePage) {
-  const url = TAILSCALE_PAGES[page] || TAILSCALE_PAGES.login;
-  if (!isPublicTailscaleUrl(url)) throw new AccessError("TAILSCALE", "رابط غير صالح.");
+async function tailscaleExe() {
+  const { existsSync } = await import("node:fs");
+  for (const path of exeCandidates()) if (existsSync(path)) return path;
+  return "tailscale";
+}
+
+function run(exe: string, args: string[], timeoutMs: number) {
+  return new Promise<{ code: number; out: string; err: string }>((resolve) => {
+    import("node:child_process").then(({ spawn }) => {
+      const child = spawn(exe, args, { windowsHide: true });
+      let out = "", err = "", settled = false;
+      const finish = (code: number) => { if (settled) return; settled = true; clearTimeout(timer); resolve({ code, out, err }); };
+      const timer = setTimeout(() => finish(-1), timeoutMs);
+      child.stdout?.on("data", (d) => { out += String(d); });
+      child.stderr?.on("data", (d) => { err += String(d); });
+      child.on("error", (e) => { err += e.message; finish(-1); });
+      child.on("close", (code) => finish(code ?? 1));
+    }).catch((e) => resolve({ code: -1, out: "", err: String(e) }));
+  });
+}
+
+function parseStatus(text: string): Status | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
+  try { return JSON.parse(text.slice(start)) as Status; } catch { return null; }
+}
+
+function rowsOf(status: Status): DeviceRow[] {
+  return Object.values(status.Peer || {}).map((p) => ({
+    name: p.HostName || (p.DNSName || "").replace(/\.$/, "") || "جهاز",
+    dns: (p.DNSName || "").replace(/\.$/, ""),
+    ip: (p.TailscaleIPs || []).find((ip) => ip.startsWith("100.")) || (p.TailscaleIPs || [])[0] || "",
+    os: p.OS || "",
+    online: Boolean(p.Online),
+  })).filter((p) => p.ip).sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+}
+
+async function readStatus() {
+  const exe = await tailscaleExe();
+  const r = await run(exe, ["status", "--json"], 12000);
+  const status = parseStatus(r.out) || parseStatus(r.err);
+  if (!status) throw new AccessError("TAILSCALE", "مش لاقي Tailscale على الويندوز، أو مش شغال. افتح برنامج Tailscale أولاً.");
+  const self = status.Self || {};
+  const user = status.User?.[String(self.UserID)] || {};
+  return {
+    state: status.BackendState || "",
+    account: user.LoginName || "",
+    displayName: user.DisplayName || "",
+    selfName: self.HostName || "",
+    selfIp: (self.TailscaleIPs || [])[0] || "",
+    authUrl: status.AuthURL || "",
+    devices: rowsOf(status),
+  };
+}
+
+async function openPrivate(url: string) {
+  if (!isTailscaleAuthUrl(url) || process.platform !== "win32") return false;
   const { existsSync, mkdtempSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
-  const profileDir = mkdtempSync(join(tmpdir(), "speed-tailscale-"));
-  await sweepOldProfiles(profileDir);
-  const pick = pickPrivateBrowser(process.env, existsSync, url, profileDir);
-  if (dry() || process.platform !== "win32")
-    return { url, browser: pick?.browser || "none", private: Boolean(pick), freshProfile: Boolean(pick), args: pick?.args || [], dryRun: true };
-  if (!pick) return { url, browser: "none", private: false, freshProfile: false, args: [], dryRun: false };
+  const pick = pickPrivateBrowser(process.env, existsSync, url, mkdtempSync(join(tmpdir(), "speed-tailscale-")));
+  if (!pick) return false;
   const { spawn } = await import("node:child_process");
   spawn(pick.exe, pick.args, { windowsHide: false, detached: true, stdio: "ignore" }).unref();
-  return { url, browser: pick.browser, private: true, freshProfile: true, args: [], dryRun: false };
+  return true;
 }
 
-/** Read-only reachability of one device address (unauthenticated GET deviceInfo; no passwords sent). */
+/** Devices on the tailnet this Windows PC is already joined to. */
+export async function listTailscaleDevices() {
+  return readStatus();
+}
+
+/**
+ * Log this PC's Tailscale out and start a fresh login. The auth URL joins THIS computer,
+ * unlike opening the admin website, which only shows machines and saves nothing back.
+ */
+export async function switchTailscaleAccount() {
+  const exe = await tailscaleExe();
+  await run(exe, ["logout"], 20000);
+  const { spawn } = await import("node:child_process");
+  const child = spawn(exe, ["login"], { windowsHide: true });
+  let buf = "";
+  const url = await new Promise<string>((resolve) => {
+    const timer = setTimeout(() => resolve(AUTH_URL.exec(buf)?.[0] || ""), 10000);
+    const take = (d: Buffer) => {
+      buf += d.toString();
+      const m = AUTH_URL.exec(buf);
+      if (m) { clearTimeout(timer); resolve(m[0]); }
+    };
+    child.stdout?.on("data", take);
+    child.stderr?.on("data", take);
+    child.on("error", () => { clearTimeout(timer); resolve(""); });
+  });
+  child.unref();
+  const opened = url ? await openPrivate(url) : false;
+  return { url, opened };
+}
+
 export async function reachDevice(host: string, port: number) {
   if (!isDeviceAddress(host) || port < 1 || port > 65535) throw new AccessError("ENDPOINT", "العنوان لازم يكون IP خاص أو Tailscale، مش عنوان إنترنت عام.");
   const started = Date.now();
