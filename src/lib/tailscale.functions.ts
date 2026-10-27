@@ -12,9 +12,12 @@ async function guard<T>(minimum: "operator" | "admin", run: () => Promise<T>) {
 }
 const mod = () => import("./access/tailscale.server");
 
-export const tsOpenSiteFn = createServerFn({ method: "POST" })
-  .validator((data: { page: string }) => ({ page: data?.page === "machines" ? ("machines" as const) : ("login" as const) }))
-  .handler(({ data }) => guard("admin", async () => (await mod()).openTailscaleSite(data.page)));
+export const tsDevicesFn = createServerFn({ method: "POST" })
+  .validator(() => ({}))
+  .handler(() => guard("operator", async () => (await mod()).listTailscaleDevices()));
+export const tsSwitchFn = createServerFn({ method: "POST" })
+  .validator(() => ({}))
+  .handler(() => guard("admin", async () => (await mod()).switchTailscaleAccount()));
 export const reachDeviceFn = createServerFn({ method: "POST" })
   .validator((data: { host: string; port: number }) => ({ host: String(data?.host || "").trim().slice(0, 253), port: Number(data?.port) || 80 }))
   .handler(({ data }) => guard("operator", async () => (await mod()).reachDevice(data.host, data.port)));
