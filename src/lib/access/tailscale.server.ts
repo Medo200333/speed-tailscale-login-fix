@@ -1,13 +1,12 @@
 /**
  * Reads the Tailscale client already installed on this Windows PC (`tailscale status --json`)
- * and returns its devices. The admin website is not a data source: closing it changes nothing.
- * A login, when needed, uses the auth URL from the local client so THIS machine joins the tailnet.
+ * and returns the fingerprint addresses advertised as subnet routes, not the computers' 100.x addresses.
  */
 import { AccessError } from "./store.server";
 import { AUTH_URL, isDeviceAddress, isTailscaleAuthUrl, pickPrivateBrowser } from "./tailscale-core";
 import { isapiFingerprint } from "./sadp.server";
 
-type RawPeer = { HostName?: string; DNSName?: string; TailscaleIPs?: string[]; Online?: boolean; OS?: string; UserID?: number };
+type RawPeer = { HostName?: string; DNSName?: string; TailscaleIPs?: string[]; Online?: boolean; OS?: string; UserID?: number; PrimaryRoutes?: string[]; AllowedIPs?: string[] };
 type Status = {
   BackendState?: string;
   AuthURL?: string;
@@ -48,14 +47,27 @@ function parseStatus(text: string): Status | null {
   try { return JSON.parse(text.slice(start)) as Status; } catch { return null; }
 }
 
+function lanRoute(cidr: string) {
+  const m = /^(\d{1,3}(?:\.\d{1,3}){3})\/32$/.exec((cidr || "").trim());
+  if (!m || !isDeviceAddress(m[1])) return "";
+  const [a, b] = m[1].split(".").map(Number);
+  if (a === 100 && b >= 64 && b <= 127) return "";
+  return m[1];
+}
+
 function rowsOf(status: Status): DeviceRow[] {
-  return Object.values(status.Peer || {}).map((p) => ({
-    name: p.HostName || (p.DNSName || "").replace(/\.$/, "") || "جهاز",
-    dns: (p.DNSName || "").replace(/\.$/, ""),
-    ip: (p.TailscaleIPs || []).find((ip) => ip.startsWith("100.")) || (p.TailscaleIPs || [])[0] || "",
-    os: p.OS || "",
-    online: Boolean(p.Online),
-  })).filter((p) => p.ip).sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+  const rows: DeviceRow[] = [];
+  for (const p of Object.values(status.Peer || {})) {
+    const name = p.HostName || (p.DNSName || "").replace(/\.$/, "") || "جهاز";
+    const seen = new Set<string>();
+    for (const cidr of [...(p.PrimaryRoutes || []), ...(p.AllowedIPs || [])]) {
+      const ip = lanRoute(cidr);
+      if (!ip || seen.has(ip)) continue;
+      seen.add(ip);
+      rows.push({ name, dns: (p.DNSName || "").replace(/\.$/, ""), ip, os: p.OS || "", online: Boolean(p.Online) });
+    }
+  }
+  return rows.sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
 }
 
 async function readStatus() {
@@ -88,7 +100,7 @@ async function openPrivate(url: string) {
   return true;
 }
 
-/** Devices on the tailnet this Windows PC is already joined to. */
+/** Fingerprint addresses behind online Tailscale machines. */
 export async function listTailscaleDevices() {
   return readStatus();
 }
